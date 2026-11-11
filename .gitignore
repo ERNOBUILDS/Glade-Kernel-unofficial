@@ -129,3 +129,21 @@ kernel/configs/android-*.cfg
 #Ignoring Android.bp link file
 #
 Android.bp
+
+# Nothing kernel: local builds, validation captures and release payloads.
+/out*/
+/artifacts/
+/logs/
+/release*/
+*.dtbo
+*.img
+*.log
+*.zip
+Image
+Image.gz
+
+# Never publish local credentials or signing material.
+*.keystore
+*.p12
+*.pem
+credentials.json
