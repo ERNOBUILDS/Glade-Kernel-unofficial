@@ -180,6 +180,9 @@ dtc_cpp_flags  = -Wp,-MD,$(depfile).pre.tmp -nostdinc                    \
 		 $(addprefix -I,$(DTC_INCLUDE))                          \
 		 -undef -D__DTS__
 
+# Only the experimental OC build emits its OSM/thermal policy properties.
+dtc_cpp_flags += $(if $(filter y,$(CONFIG_NOTHING_OC)),-DCONFIG_NOTHING_OC=1)
+
 # Finds the multi-part object the current object will be linked into
 modname-multi = $(sort $(foreach m,$(multi-used),\
 		$(if $(filter $(subst $(obj)/,,$*.o), $($(m:.o=-objs)) $($(m:.o=-y))),$(m:.o=))))

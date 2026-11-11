@@ -304,6 +304,19 @@ config CLOCK_CPU_OSM
 	 existence of multiple OSM domains.
 	 Say Y if you want to support OSM clocks.
 
+config NOTHING_OC
+	bool "Experimental Nothing kernel SDMMAGPIE CPU overclock"
+	depends on CLOCK_CPU_OSM=y && CPU_FREQ && THERMAL && THERMAL_OF
+	default n
+	help
+	  Attempt 2112/2592 MHz using unused firmware OSM LUT rows. This is
+	  experimental: LUT readback does not prove PLL lock or safe voltage.
+	  Enable only in the OC build. Stock OPPs, CPR corners and firmware
+	  thermal protection are retained. Missing/hot/stale thermal sensors
+	  or rejected/revoked LUT writes clamp requests to the stock maximum.
+	  Requires matching nothing,oc-* DT properties. nothing.oc=0 disables
+	  programming. Boot diagnostics use the Nothing-OC: prefix.
+
 config CLOCK_CPU_OSM_660
 	tristate "OSM CPU Clock Controller for SDM660"
 	depends on COMMON_CLK_QCOM

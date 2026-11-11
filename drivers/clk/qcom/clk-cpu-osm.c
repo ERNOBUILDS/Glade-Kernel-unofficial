@@ -32,7 +32,14 @@
 #include <linux/sched.h>
 #include <linux/cpufreq.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <dt-bindings/clock/qcom,cpucc-sm8150.h>
+
+#ifdef CONFIG_NOTHING_OC
+#include <linux/thermal.h>
+#include <linux/workqueue.h>
+#include <linux/suspend.h>
+#endif
 
 #include "common.h"
 #include "clk-regmap.h"
@@ -51,7 +58,14 @@
 #define ENABLE_REG			0x0
 #define FREQ_REG			0x110
 #define VOLT_REG			0x114
+#define OVERRIDE_REG			0x118
 #define CORE_DCVS_CTRL			0xbc
+#define OSM_FREQ_LVAL_MASK		GENMASK(7, 0)
+#define OSM_FREQ_ROW_MASK		GENMASK(15, 8)
+
+#ifdef CONFIG_NOTHING_OC
+#include "clk-cpu-osm-nothing.h"
+#endif
 
 #define DCVS_PERF_STATE_DESIRED_REG_0	0x920
 #define DCVS_PERF_STATE_DESIRED_REG(n) \
@@ -69,7 +83,11 @@ struct osm_entry {
 
 struct clk_osm {
 	struct clk_hw hw;
+#ifdef CONFIG_NOTHING_OC
+	struct osm_entry osm_table[OSM_TABLE_SIZE + 1];
+#else
 	struct osm_entry osm_table[OSM_TABLE_SIZE];
+#endif
 	struct dentry *debugfs;
 	void __iomem *vbase;
 	phys_addr_t pbase;
@@ -83,6 +101,25 @@ struct clk_osm {
 	u32 prev_cycle_counter;
 	unsigned long rate;
 	cpumask_t related_cpus;
+#ifdef CONFIG_NOTHING_OC
+	struct clk_osm *oc_parent;
+	struct osm_lut_row oc_expected[2];
+	u32 oc_freq_words[OSM_TABLE_SIZE];
+	u32 oc_volt_words[OSM_TABLE_SIZE];
+	u32 oc_stock_entries;
+	u32 oc_stock_index;
+	u32 oc_stock_khz;
+	u32 oc_stock_limit_khz;
+	u32 oc_target_khz;
+	u32 oc_row;
+	unsigned long oc_thermal_sample;
+	bool oc_active;
+	bool oc_hw_verified;
+	bool oc_thermal_blocked;
+	bool oc_previous_allowed;
+	bool oc_thermal_logged;
+	bool oc_request_logged;
+#endif
 };
 
 static bool is_sdmshrike;
@@ -90,6 +127,14 @@ static bool is_sm6150;
 static bool is_sdmmagpie;
 static bool is_trinket;
 static bool is_atoll;
+
+#ifdef CONFIG_NOTHING_OC
+static bool nothing_oc_can_request(struct clk_osm *c);
+static unsigned int nothing_oc_select_index(struct cpufreq_policy *policy,
+					   unsigned int index);
+static unsigned int nothing_oc_request_index(struct cpufreq_policy *policy,
+					    unsigned int index);
+#endif
 
 static inline struct clk_osm *to_clk_osm(struct clk_hw *_hw)
 {
@@ -591,6 +636,7 @@ osm_set_index(struct clk_osm *c, unsigned int index, unsigned int num)
 	clk_osm_mb(c);
 }
 
+#ifndef CONFIG_NOTHING_OC
 static int
 osm_cpufreq_target_index(struct cpufreq_policy *policy, unsigned int index)
 {
@@ -602,6 +648,43 @@ osm_cpufreq_target_index(struct cpufreq_policy *policy, unsigned int index)
 			    policy->cpuinfo.max_freq);
 	return 0;
 }
+#else
+/* Own the slow-path notifications so clamped requests are not counted as OC. */
+static int osm_cpufreq_target(struct cpufreq_policy *policy,
+			     unsigned int target_freq, unsigned int relation)
+{
+	struct cpufreq_freqs freqs = { .old = policy->cur, .flags = 0 };
+	unsigned int actual;
+	int index, ret;
+
+	index = cpufreq_frequency_table_target(policy, target_freq, relation);
+	if (index < 0)
+		return index;
+	index = nothing_oc_select_index(policy, index);
+	freqs.new = policy->freq_table[index].frequency;
+	if (freqs.new == freqs.old)
+		return 0;
+
+	cpufreq_freq_transition_begin(policy, &freqs);
+	actual = nothing_oc_request_index(policy, index);
+	ret = actual ? 0 : -EIO;
+	if (actual)
+		freqs.new = actual;
+	cpufreq_freq_transition_end(policy, &freqs, ret);
+	return ret;
+}
+
+static int osm_cpufreq_verify(struct cpufreq_policy *policy)
+{
+	struct clk_osm *core = policy->driver_data;
+	struct clk_osm *c = core ? core->oc_parent : NULL;
+
+	if (c && c->oc_active && !nothing_oc_can_request(c))
+		cpufreq_verify_within_limits(policy, policy->cpuinfo.min_freq,
+					    c->oc_stock_khz);
+	return cpufreq_generic_frequency_table_verify(policy);
+}
+#endif
 
 static unsigned int
 osm_cpufreq_fast_switch(struct cpufreq_policy *policy, unsigned int target_freq)
@@ -613,9 +696,13 @@ osm_cpufreq_fast_switch(struct cpufreq_policy *policy, unsigned int target_freq)
 	if (index < 0)
 		return 0;
 
+#ifdef CONFIG_NOTHING_OC
+	index = nothing_oc_select_index(policy, index);
+	return nothing_oc_request_index(policy, index);
+#else
 	osm_cpufreq_target_index(policy, index);
-
 	return policy->freq_table[index].frequency;
+#endif
 }
 
 static unsigned int osm_cpufreq_get(unsigned int cpu)
@@ -630,6 +717,15 @@ static unsigned int osm_cpufreq_get(unsigned int cpu)
 	c = policy->driver_data;
 	index = clk_osm_read_reg(c,
 			DCVS_PERF_STATE_DESIRED_REG(c->core_num));
+#ifdef CONFIG_NOTHING_OC
+	/* A software-only OC table row must never masquerade as a hardware rate. */
+	if (c->oc_parent) {
+		if (index >= c->oc_parent->osm_table_size)
+			return 0;
+		return nothing_oc_lut_rate(clk_osm_read_reg_no_log(c,
+				FREQ_REG + index * OSM_REG_SIZE)) / 1000;
+	}
+#endif
 	return policy->freq_table[index].frequency;
 }
 
@@ -639,7 +735,7 @@ static int osm_cpufreq_cpu_init(struct cpufreq_policy *policy)
 	struct clk_osm *c, *parent;
 	struct clk_hw *p_hw;
 	int ret;
-	unsigned int i;
+	unsigned int i, rows;
 
 	c = osm_configure_policy(policy);
 	if (!c) {
@@ -656,14 +752,29 @@ static int osm_cpufreq_cpu_init(struct cpufreq_policy *policy)
 	parent = to_clk_osm(p_hw);
 	c->vbase = parent->vbase;
 
+#ifdef CONFIG_NOTHING_OC
+	c->oc_parent = parent;
+	table = kcalloc(parent->osm_table_size + 2, sizeof(*table), GFP_KERNEL);
+#else
 	table = kcalloc(parent->osm_table_size + 1, sizeof(*table), GFP_KERNEL);
+#endif
 	if (!table)
 		return -ENOMEM;
 
-	for (i = 0; i < parent->osm_table_size; i++) {
+	rows = parent->osm_table_size;
+#ifdef CONFIG_NOTHING_OC
+	/* Freeze stock rows: rejected/partially restored tail slots are quarantined. */
+	if (parent->oc_active)
+		rows = parent->oc_stock_entries;
+#endif
+	for (i = 0; i < rows; i++) {
 		u32 data, src, div, lval, core_count;
 
 		data = clk_osm_read_reg(c, FREQ_REG + i * OSM_REG_SIZE);
+#ifdef CONFIG_NOTHING_OC
+		if (parent->oc_active)
+			data = parent->oc_freq_words[i];
+#endif
 		src = (data & GENMASK(31, 30)) >> 30;
 		div = (data & GENMASK(29, 28)) >> 28;
 		lval = data & GENMASK(7, 0);
@@ -691,6 +802,18 @@ static int osm_cpufreq_cpu_init(struct cpufreq_policy *policy)
 			break;
 		}
 	}
+#ifdef CONFIG_NOTHING_OC
+	if (parent->oc_active) {
+		/* Preserve the stock duplicate-terminator boost interpretation. */
+		if (i && table[i - 1].frequency == CPUFREQ_ENTRY_INVALID) {
+			table[i - 1].flags = CPUFREQ_BOOST_FREQ;
+			table[i - 1].frequency = table[i - 1].driver_data;
+		}
+		table[i].frequency = parent->oc_target_khz;
+		table[i].driver_data = parent->oc_target_khz;
+		i++;
+	}
+#endif
 	table[i].frequency = CPUFREQ_TABLE_END;
 
 	ret = cpufreq_table_validate_and_show(policy, table);
@@ -704,6 +827,20 @@ static int osm_cpufreq_cpu_init(struct cpufreq_policy *policy)
 	policy->driver_data = c;
 
 	cpumask_copy(policy->cpus, &c->related_cpus);
+
+#ifdef CONFIG_NOTHING_OC
+	if (is_sdmmagpie) {
+		pr_info("Nothing-OC: cluster=%u cpu=%u final cpufreq table; LUT-accepted=%u OC-selected=%u initial-guard=stock max=%u kHz; rates are requests, NOT PLL measurements\n",
+			parent->cluster_num, policy->cpu, parent->oc_hw_verified,
+			parent->oc_active, parent->oc_stock_khz);
+		for (i = 0; table[i].frequency != CPUFREQ_TABLE_END; i++)
+			pr_info("Nothing-OC: cluster=%u final table[%u]=%u kHz flags=%#x software-only=%u\n",
+				parent->cluster_num, i, table[i].frequency,
+				table[i].flags, parent->oc_active &&
+				i == parent->oc_stock_entries &&
+				!parent->oc_hw_verified);
+	}
+#endif
 
 	return 0;
 
@@ -728,8 +865,13 @@ static struct freq_attr *osm_cpufreq_attr[] = {
 static struct cpufreq_driver qcom_osm_cpufreq_driver = {
 	.flags		= CPUFREQ_STICKY | CPUFREQ_NEED_INITIAL_FREQ_CHECK |
 			  CPUFREQ_HAVE_GOVERNOR_PER_POLICY,
+#ifdef CONFIG_NOTHING_OC
+	.verify		= osm_cpufreq_verify,
+	.target		= osm_cpufreq_target,
+#else
 	.verify		= cpufreq_generic_frequency_table_verify,
 	.target_index	= osm_cpufreq_target_index,
+#endif
 	.get		= osm_cpufreq_get,
 	.init		= osm_cpufreq_cpu_init,
 	.exit		= osm_cpufreq_cpu_exit,
@@ -917,27 +1059,485 @@ static u64 clk_osm_get_cpu_cycle_counter(int cpu)
 	val = clk_osm_read_reg_no_log(parent,
 				OSM_CYCLE_COUNTER_STATUS_REG(core_num));
 
-	if (val < c->prev_cycle_counter) {
-		/* Handle counter overflow */
-		c->total_cycle_counter += UINT_MAX -
-			c->prev_cycle_counter + val;
-		c->prev_cycle_counter = val;
-	} else {
-		c->total_cycle_counter += val - c->prev_cycle_counter;
-		c->prev_cycle_counter = val;
-	}
+	/* Unsigned subtraction handles the 32-bit counter wrapping exactly. */
+	c->total_cycle_counter += (u32)(val - c->prev_cycle_counter);
+	c->prev_cycle_counter = val;
 	cycle_counter_ret = c->total_cycle_counter;
 	spin_unlock_irqrestore(&parent->lock, flags);
 
 	return cycle_counter_ret;
 }
 
+#ifdef CONFIG_NOTHING_OC
+static bool nothing_oc_enabled = true;
+static bool nothing_oc_dt_ready;
+static bool nothing_oc_suspended;
+static bool nothing_oc_pm_registered;
+static const char *nothing_oc_zones[3];
+static u32 nothing_oc_trips[3];
+static u32 nothing_oc_resume[3];
+
+static int __init nothing_oc_setup(char *str)
+{
+	if (!str)
+		return 0;
+
+	if (!strcmp(str, "0") || !strcmp(str, "off") || !strcmp(str, "no") ||
+	    !strcmp(str, "disable") || !strcmp(str, "disabled"))
+		nothing_oc_enabled = false;
+
+	return 0;
+}
+early_param("nothing.oc", nothing_oc_setup);
+
+static void clk_osm_read_lut_row(struct clk_osm *c, u32 row,
+			       struct osm_lut_row *entry)
+{
+	u32 off = row * OSM_REG_SIZE;
+
+	entry->freq = clk_osm_read_reg_no_log(c, FREQ_REG + off);
+	entry->volt = clk_osm_read_reg_no_log(c, VOLT_REG + off);
+	entry->override = clk_osm_read_reg_no_log(c, OVERRIDE_REG + off);
+}
+
+static bool clk_osm_lut_row_matches(struct clk_osm *c, u32 row,
+				  const struct osm_lut_row *expected)
+{
+	struct osm_lut_row actual;
+
+	clk_osm_read_lut_row(c, row, &actual);
+	return actual.freq == expected->freq && actual.volt == expected->volt &&
+		actual.override == expected->override;
+}
+
+static void nothing_oc_print_row(struct clk_osm *c, u32 row,
+				const char *phase, const struct osm_lut_row *r)
+{
+	pr_info("Nothing-OC: cluster=%u %s LUT[%u] freq=%lu Hz corner=%u open-loop=%u mV PLL-L=%u src=%u div=%u cores=%u row-id=%u raw-freq=%#x raw-volt=%#x override=%#x\n",
+		c->cluster_num, phase, row, nothing_oc_lut_rate(r->freq),
+		(r->volt >> 16) & GENMASK(5, 0), r->volt & GENMASK(11, 0),
+		r->freq & OSM_FREQ_LVAL_MASK, r->freq >> 30,
+		(r->freq >> 28) & 3, CORE_COUNT_VAL(r->freq),
+		(r->freq & OSM_FREQ_ROW_MASK) >> 8, r->freq, r->volt,
+		r->override);
+}
+
+static void nothing_oc_dump_lut(struct clk_osm *c, const char *phase)
+{
+	struct osm_lut_row row;
+	u32 i;
+
+	for (i = 0; i < c->osm_table_size; i++) {
+		clk_osm_read_lut_row(c, i, &row);
+		nothing_oc_print_row(c, i, phase, &row);
+	}
+}
+
+static bool clk_osm_program_lut_row(struct clk_osm *c, u32 row,
+				   const struct osm_lut_row *entry,
+				   bool restore)
+{
+	struct osm_lut_row actual;
+	u32 off = row * OSM_REG_SIZE;
+
+	/* Verify voltage BEFORE exposing the new L; never write OVERRIDE. */
+	if (restore) {
+		clk_osm_write_reg(c, entry->freq, FREQ_REG + off);
+		wmb();
+		clk_osm_mb(c);
+		if ((u32)clk_osm_read_reg_no_log(c, FREQ_REG + off) != entry->freq) {
+			pr_info("Nothing-OC: cluster=%u rollback row=%u FREQ rejected; voltage retained; unused tail quarantined\n",
+				c->cluster_num, row);
+			return false;
+		}
+		clk_osm_write_reg(c, entry->volt, VOLT_REG + off);
+	} else {
+		clk_osm_write_reg(c, entry->volt, VOLT_REG + off);
+		wmb();
+		clk_osm_mb(c);
+		if ((u32)clk_osm_read_reg_no_log(c, VOLT_REG + off) != entry->volt) {
+			pr_info("Nothing-OC: cluster=%u program row=%u VOLT rejected; FREQ not written\n",
+				c->cluster_num, row);
+			return false;
+		}
+		clk_osm_write_reg(c, entry->freq, FREQ_REG + off);
+	}
+	wmb();
+	clk_osm_mb(c);
+	clk_osm_read_lut_row(c, row, &actual);
+	pr_info("Nothing-OC: cluster=%u %s row=%u FREQ-accepted=%u VOLT-accepted=%u OVERRIDE-unchanged=%u (not written) expected=%#x/%#x/%#x read=%#x/%#x/%#x\n",
+		c->cluster_num, restore ? "rollback" : "program", row,
+		actual.freq == entry->freq, actual.volt == entry->volt,
+		actual.override == entry->override, entry->freq, entry->volt,
+		entry->override, actual.freq, actual.volt, actual.override);
+	return actual.freq == entry->freq && actual.volt == entry->volt &&
+		actual.override == entry->override;
+}
+
+/*
+ * One probe-time attempt, before cpufreq registration. Only two unused tail
+ * rows are ever written. Failed or partially restored tails are excluded from
+ * all hardware requests; the diagnostic software entry remains visible.
+ */
+static int clk_osm_oc_apply(struct clk_osm *c, u32 valid)
+{
+	struct osm_lut_row top, previous, saved[2], updated[2];
+	u32 vc, mv, new_mv, stock_lval, lval;
+	u32 i, cores, desired;
+	int step;
+	bool restored[2], stock_unchanged = true;
+
+	if (!c->oc_active)
+		return 0;
+	lval = c->oc_target_khz / (XO_RATE / 1000);
+	pr_info("Nothing-OC: cluster=%u PLL maximum=unknown: firmware-managed OSM has no Linux CPU PLL/VCO handle; target=%u kHz L=%u; readback is NOT physical OC proof\n",
+		c->cluster_num, c->oc_target_khz, lval);
+
+	/* Leave room for the duplicate terminator row. */
+	if (valid < 2 || valid >= c->osm_table_size - 1 ||
+	    lval > OSM_FREQ_LVAL_MASK) {
+		pr_info("Nothing-OC: cluster=%u no safe pair of tail rows (end=%u); software OC is stock-clamped\n",
+			c->cluster_num, valid);
+		return 0;
+	}
+
+	clk_osm_read_lut_row(c, valid - 1, &top);
+	clk_osm_read_lut_row(c, valid - 2, &previous);
+	stock_lval = c->cluster_num == 1 ? NOTHING_STOCK_PWRCL_LVAL :
+		NOTHING_STOCK_PERFCL_LVAL;
+	if ((top.freq & OSM_FREQ_LVAL_MASK) != stock_lval ||
+	    lval <= stock_lval || (top.freq >> 28) != 4 ||
+	    CORE_COUNT_VAL(top.freq) <= SINGLE_CORE_COUNT ||
+	    ((top.freq & OSM_FREQ_ROW_MASK) >> 8) != valid - 1) {
+		pr_info("Nothing-OC: cluster=%u unexpected stock/source/core/row metadata top=%#x; no writes, software OC stock-clamped\n",
+			c->cluster_num, top.freq);
+		return 0;
+	}
+
+	/*
+	 * SDMMAGPIE firmware fills unused slots with the last operating point,
+	 * but FREQ[15:8] is the physical row index and increases for every slot.
+	 * Check both duplicates, masking only that index, before reusing them.
+	 */
+	for (i = 0; i < ARRAY_SIZE(saved); i++) {
+		clk_osm_read_lut_row(c, valid + i, &saved[i]);
+		if (((saved[i].freq ^ top.freq) & ~OSM_FREQ_ROW_MASK) ||
+		    ((saved[i].freq & OSM_FREQ_ROW_MASK) >> 8) != valid + i ||
+		    saved[i].volt != top.volt ||
+		    saved[i].override != top.override) {
+			pr_info("Nothing-OC: cluster=%u row=%u is not a matching inactive duplicate; no writes, software OC stock-clamped\n",
+				c->cluster_num, valid + i);
+			return 0;
+		}
+	}
+
+	/* Do not edit a slot currently requested by firmware. */
+	cores = c->per_core_dcvs ? (c->cluster_num == 1 ? 6 : 2) : 1;
+	for (i = 0; i < cores; i++) {
+		desired = clk_osm_read_reg_no_log(c,
+				DCVS_PERF_STATE_DESIRED_REG(i));
+		if (desired >= valid) {
+			pr_info("Nothing-OC: cluster=%u core=%u desired=%u uses a tail slot; no writes, software OC stock-clamped\n",
+				c->cluster_num, i, desired);
+			return 0;
+		}
+	}
+
+	vc = (top.volt >> 16) & GENMASK(5, 0);
+	mv = top.volt & GENMASK(11, 0);
+	step = nothing_oc_voltage_step(stock_lval,
+		previous.freq & OSM_FREQ_LVAL_MASK, lval, mv,
+		previous.volt & GENMASK(11, 0));
+	if (step < 0 || vc > 60 || (previous.freq >> 28) != 4) {
+		pr_info("Nothing-OC: cluster=%u stock voltage/slope implausible (corner=%u mV=%u); no writes, software OC stock-clamped\n",
+			c->cluster_num, vc, mv);
+		return 0;
+	}
+	new_mv = mv + step;
+	c->osm_table[valid].open_loop_volt = new_mv;
+	pr_info("Nothing-OC: cluster=%u voltage old +32 mV REMOVED; bounded stock-slope step=+%d mV (%u -> %u), corner=%u reused; stock OPP voltages untouched; CPR/actual rail unverified\n",
+		c->cluster_num, step, mv, new_mv, vc);
+
+	/*
+	 * Only FREQ[7:0] carries the integer PLL multiplier. Preserve the row
+	 * index, source, divider, core count and transition metadata. In
+	 * particular, OVERRIDE is not an L-value: leave that register alone.
+	 *
+	 * CPR corners are firmware-owned. Reuse the highest configured corner
+	 * and request only the bounded open-loop margin. The actual rail may
+	 * remain controlled by closed-loop firmware; do not invent CPR corners.
+	 */
+	for (i = 0; i < ARRAY_SIZE(updated); i++) {
+		updated[i] = saved[i];
+		updated[i].freq = (saved[i].freq & ~OSM_FREQ_LVAL_MASK) | lval;
+		updated[i].volt = (saved[i].volt & ~GENMASK(11, 0)) | new_mv;
+		c->oc_expected[i] = updated[i];
+	}
+
+	/* Prepare the duplicate first, before exposing the extra cpufreq row. */
+	if (!clk_osm_program_lut_row(c, valid + 1, &updated[1], false))
+		goto rollback;
+	if (!clk_osm_program_lut_row(c, valid, &updated[0], false) ||
+	    !clk_osm_lut_row_matches(c, valid + 1, &updated[1]))
+		goto rollback;
+
+	for (i = 0; i < valid; i++)
+		if ((u32)clk_osm_read_reg_no_log(c, FREQ_REG + i * OSM_REG_SIZE) !=
+		    c->oc_freq_words[i] ||
+		    (u32)clk_osm_read_reg_no_log(c, VOLT_REG + i * OSM_REG_SIZE) !=
+		    c->oc_volt_words[i])
+			stock_unchanged = false;
+	pr_info("Nothing-OC: cluster=%u stock FREQ/VOLT readback unchanged=%u; stock register writes=0\n",
+		c->cluster_num, stock_unchanged);
+	if (!stock_unchanged)
+		goto rollback;
+
+	WRITE_ONCE(c->oc_hw_verified, true);
+	pr_info("Nothing-OC: cluster=%u LUT writes ACCEPTED by immediate readback; override unchanged; %u -> %u kHz; OC remains blocked until fresh cool sensors; PLL lock/rate/voltage UNVERIFIED\n",
+		c->cluster_num, c->oc_stock_khz, c->oc_target_khz);
+
+	return 1;
+
+rollback:
+	restored[0] = clk_osm_program_lut_row(c, valid, &saved[0], true);
+	restored[1] = clk_osm_program_lut_row(c, valid + 1, &saved[1], true);
+	WRITE_ONCE(c->oc_hw_verified, false);
+	pr_info("Nothing-OC: cluster=%u writes/metadata rejected; rollback=%s; both tail slots quarantined; software OC entry permanently stock-clamped\n",
+		c->cluster_num, restored[0] && restored[1] ? "verified" : "FAILED");
+	return 0;
+}
+
+static bool nothing_oc_can_request(struct clk_osm *c)
+{
+	unsigned long sample = smp_load_acquire(&c->oc_thermal_sample);
+
+	return c->oc_active && READ_ONCE(c->oc_hw_verified) &&
+		!READ_ONCE(nothing_oc_suspended) &&
+		!READ_ONCE(c->oc_thermal_blocked) && sample &&
+		!time_after(jiffies, sample + msecs_to_jiffies(NOTHING_OC_STALE_MS));
+}
+
+static void nothing_oc_revoke(struct clk_osm *c, const char *reason)
+{
+	if (READ_ONCE(c->oc_hw_verified)) {
+		WRITE_ONCE(c->oc_hw_verified, false);
+		pr_info("Nothing-OC: cluster=%u %s; OC permanently revoked, stock request clamp enabled\n",
+			c->cluster_num, reason);
+	}
+}
+
+static unsigned int nothing_oc_select_index(struct cpufreq_policy *policy,
+					   unsigned int index)
+{
+	struct clk_osm *core = policy->driver_data;
+	struct clk_osm *c = core->oc_parent;
+
+	if (!c || !c->oc_active ||
+	    policy->freq_table[index].frequency <= c->oc_stock_khz)
+		return index;
+	if (nothing_oc_can_request(c) &&
+	    (!clk_osm_lut_row_matches(c, c->oc_row, &c->oc_expected[0]) ||
+	     !clk_osm_lut_row_matches(c, c->oc_row + 1, &c->oc_expected[1])))
+		nothing_oc_revoke(c, "firmware LUT/override readback changed");
+	return nothing_oc_can_request(c) ? index : c->oc_stock_index;
+}
+
+static unsigned int nothing_oc_request_index(struct cpufreq_policy *policy,
+					    unsigned int index)
+{
+	struct clk_osm *core = policy->driver_data;
+	struct clk_osm *c = core->oc_parent;
+	u32 desired;
+	unsigned int actual;
+
+	/* Recheck after slow-path PRECHANGE and immediately before the request. */
+	index = nothing_oc_select_index(policy, index);
+	osm_set_index(core, index, core->core_num);
+	actual = policy->freq_table[index].frequency;
+	if (c && c->oc_active) {
+		desired = clk_osm_read_reg_no_log(core,
+				DCVS_PERF_STATE_DESIRED_REG(core->core_num));
+		if (actual > c->oc_stock_khz &&
+		    (desired != index ||
+		     !clk_osm_lut_row_matches(c, c->oc_row, &c->oc_expected[0]) ||
+		     !clk_osm_lut_row_matches(c, c->oc_row + 1, &c->oc_expected[1]))) {
+			nothing_oc_revoke(c, "OC desired-state or LUT readback rejected");
+			osm_set_index(core, c->oc_stock_index, core->core_num);
+			desired = clk_osm_read_reg_no_log(core,
+				DCVS_PERF_STATE_DESIRED_REG(core->core_num));
+		}
+		if (desired >= c->osm_table_size) {
+			pr_info("Nothing-OC: cluster=%u invalid desired index=%u; rate unknown\n",
+				c->cluster_num, desired);
+			return 0;
+		}
+		actual = nothing_oc_lut_rate(clk_osm_read_reg_no_log(core,
+				FREQ_REG + desired * OSM_REG_SIZE)) / 1000;
+		if (actual > c->oc_stock_khz && !c->oc_request_logged) {
+			c->oc_request_logged = true;
+			pr_info("Nothing-OC: cluster=%u first OC REQUEST desired-row=%u readback=%u kHz; physical PLL frequency/lock UNVERIFIED\n",
+				c->cluster_num, desired, actual);
+		}
+	}
+	arch_set_freq_scale(policy->related_cpus, actual, policy->cpuinfo.max_freq);
+	return actual;
+}
+
+static void nothing_oc_configure(struct platform_device *pdev)
+{
+	struct device_node *np = pdev->dev.of_node;
+	u32 targets[2], stock[2];
+	const char *expected[] = { "cpu-0-max-step", "cpu-1-max-step", "quiet_therm" };
+	u32 i;
+
+	if (!is_sdmmagpie)
+		return;
+	pr_info("Nothing-OC: CONFIG_NOTHING_OC=y command-line enabled=%u compatible=qcom,clk-cpu-osm-sdmmagpie; CPU PLL maximum=unknown (no Linux PLL handle); LMH/CPR/thermal protections unchanged\n",
+		nothing_oc_enabled);
+	if (of_property_read_u32_array(np, "nothing,oc-target-khz", targets, 2) ||
+	    of_property_read_u32_array(np, "nothing,oc-stock-max-khz", stock, 2) ||
+	    targets[0] != XO_RATE / 1000 * NOTHING_OC_PWRCL_LVAL ||
+	    targets[1] != XO_RATE / 1000 * NOTHING_OC_PERFCL_LVAL ||
+	    stock[0] != XO_RATE / 1000 * NOTHING_STOCK_PWRCL_LVAL ||
+	    stock[1] != XO_RATE / 1000 * NOTHING_STOCK_PERFCL_LVAL ||
+	    of_property_count_strings(np, "nothing,oc-thermal-zones") != 3 ||
+	    of_property_read_u32_array(np, "nothing,oc-trip-millicelsius",
+				      nothing_oc_trips, 3) ||
+	    of_property_read_u32_array(np, "nothing,oc-resume-millicelsius",
+				      nothing_oc_resume, 3))
+		goto invalid;
+	for (i = 0; i < 3; i++) {
+		if (of_property_read_string_index(np, "nothing,oc-thermal-zones", i,
+						 &nothing_oc_zones[i]) ||
+		    strcmp(nothing_oc_zones[i], expected[i]) ||
+		    nothing_oc_trips[i] > (i == 2 ? 42000 : 70000) ||
+		    nothing_oc_trips[i] < (i == 2 ? 35000 : 50000) ||
+		    nothing_oc_resume[i] < (i == 2 ? 30000 : 40000) ||
+		    nothing_oc_resume[i] >= nothing_oc_trips[i])
+			goto invalid;
+		pr_info("Nothing-OC: thermal zone=%s stock-cap-at=%u resume-at=%u mC poll=%u stale=%u ms%s\n",
+			nothing_oc_zones[i], nothing_oc_trips[i], nothing_oc_resume[i],
+			NOTHING_OC_POLL_MS, NOTHING_OC_STALE_MS,
+			i == 2 ? " (board/skin proxy, not measured skin temperature)" : "");
+	}
+	pwrcl_clk.oc_target_khz = targets[0];
+	perfcl_clk.oc_target_khz = targets[1];
+	pwrcl_clk.oc_stock_limit_khz = stock[0];
+	perfcl_clk.oc_stock_limit_khz = stock[1];
+	nothing_oc_dt_ready = true;
+	return;
+invalid:
+	pr_info("Nothing-OC: missing/unsafe OC DT policy; no LUT writes, stock-only requests\n");
+}
+
+static void nothing_oc_update_policies(void)
+{
+	struct cpufreq_policy *policy;
+	struct clk_osm *core;
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+		core = policy->driver_data;
+		if (policy->cpu == cpu && core && core->oc_parent &&
+		    core->oc_parent->oc_active)
+			cpufreq_update_policy(cpu);
+		cpufreq_cpu_put(policy);
+	}
+}
+
+static void nothing_oc_poll(struct work_struct *work);
+static DECLARE_DELAYED_WORK(nothing_oc_work, nothing_oc_poll);
+
+static void nothing_oc_poll(struct work_struct *work)
+{
+	struct clk_osm *clusters[] = { &pwrcl_clk, &perfcl_clk };
+	struct thermal_zone_device *zone;
+	int temperatures[3] = { -1, -1, -1 };
+	bool valid[3], update = false;
+	u32 i;
+
+	if (READ_ONCE(nothing_oc_suspended))
+		return;
+	for (i = 0; i < 3; i++) {
+		zone = thermal_zone_get_zone_by_name(nothing_oc_zones[i]);
+		valid[i] = !IS_ERR(zone) &&
+			!thermal_zone_get_temp(zone, &temperatures[i]);
+	}
+	for (i = 0; i < 2; i++) {
+		struct clk_osm *c = clusters[i];
+		bool before, blocked, allowed;
+
+		if (!c->oc_active)
+			continue;
+		before = nothing_oc_can_request(c);
+		blocked = nothing_oc_temperature_blocked(c->oc_thermal_blocked,
+			valid[i] && valid[2], temperatures[i], temperatures[2],
+			nothing_oc_trips[i], nothing_oc_resume[i],
+			nothing_oc_trips[2], nothing_oc_resume[2]);
+		WRITE_ONCE(c->oc_thermal_blocked, blocked);
+		smp_store_release(&c->oc_thermal_sample, jiffies);
+		allowed = nothing_oc_can_request(c);
+		if (!c->oc_thermal_logged || allowed != c->oc_previous_allowed ||
+		    before != allowed) {
+			pr_info("Nothing-OC: cluster=%u guard=%s cpu=%d proxy=%d mC sensors-ok=%u LUT-accepted=%u cap=%u kHz\n",
+				c->cluster_num, allowed ? "OC-request-allowed" : "stock-clamped",
+				temperatures[i], temperatures[2], valid[i] && valid[2],
+				READ_ONCE(c->oc_hw_verified),
+				allowed ? c->oc_target_khz : c->oc_stock_khz);
+			update = true;
+			c->oc_thermal_logged = true;
+		}
+		c->oc_previous_allowed = allowed;
+	}
+	if (update)
+		nothing_oc_update_policies();
+	queue_delayed_work(system_highpri_wq, &nothing_oc_work,
+			   msecs_to_jiffies(NOTHING_OC_POLL_MS));
+}
+
+static int nothing_oc_pm_event(struct notifier_block *nb,
+			       unsigned long event, void *unused)
+{
+	switch (event) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+		WRITE_ONCE(nothing_oc_suspended, true);
+		cancel_delayed_work_sync(&nothing_oc_work);
+		nothing_oc_update_policies();
+		pr_info("Nothing-OC: suspend: OC blocked and policies capped at stock\n");
+		break;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+		WRITE_ONCE(pwrcl_clk.oc_thermal_blocked, true);
+		WRITE_ONCE(perfcl_clk.oc_thermal_blocked, true);
+		WRITE_ONCE(nothing_oc_suspended, false);
+		queue_delayed_work(system_highpri_wq, &nothing_oc_work, 0);
+		break;
+	}
+	return NOTIFY_OK;
+}
+
+static struct notifier_block nothing_oc_pm_notifier = {
+	.notifier_call = nothing_oc_pm_event,
+};
+#endif /* CONFIG_NOTHING_OC */
+
 static int clk_osm_read_lut(struct platform_device *pdev, struct clk_osm *c)
 {
 	u32 data, src, lval, i, j = c->osm_table_size;
 
+#ifdef CONFIG_NOTHING_OC
+	if (is_sdmmagpie)
+		nothing_oc_dump_lut(c, "firmware");
+#endif
 	for (i = 0; i < c->osm_table_size; i++) {
 		data = clk_osm_read_reg(c, FREQ_REG + i * OSM_REG_SIZE);
+#ifdef CONFIG_NOTHING_OC
+		c->oc_freq_words[i] = data;
+#endif
 		src = ((data & GENMASK(31, 30)) >> 30);
 		lval = (data & GENMASK(7, 0));
 
@@ -947,6 +1547,9 @@ static int clk_osm_read_lut(struct platform_device *pdev, struct clk_osm *c)
 			c->osm_table[i].frequency = XO_RATE * lval;
 
 		data = clk_osm_read_reg(c, VOLT_REG + i * OSM_REG_SIZE);
+#ifdef CONFIG_NOTHING_OC
+		c->oc_volt_words[i] = data;
+#endif
 		c->osm_table[i].virtual_corner =
 					((data & GENMASK(21, 16)) >> 16);
 		c->osm_table[i].open_loop_volt = (data & GENMASK(11, 0));
@@ -961,6 +1564,35 @@ static int clk_osm_read_lut(struct platform_device *pdev, struct clk_osm *c)
 				c->osm_table[i - 1].frequency)
 			j = i;
 	}
+
+#ifdef CONFIG_NOTHING_OC
+	c->oc_stock_entries = j;
+	c->oc_thermal_blocked = true;
+	for (i = 0; i < j; i++) {
+		u32 khz = c->osm_table[i].frequency / 1000;
+
+		if (CORE_COUNT_VAL(c->oc_freq_words[i]) != SINGLE_CORE_COUNT &&
+		    (!c->oc_stock_limit_khz || khz <= c->oc_stock_limit_khz) &&
+		    khz >= c->oc_stock_khz) {
+			c->oc_stock_khz = khz;
+			c->oc_stock_index = i;
+		}
+	}
+	c->oc_active = is_sdmmagpie && nothing_oc_enabled && nothing_oc_dt_ready &&
+		(c->cluster_num == 1 || c->cluster_num == 2) && j &&
+		c->oc_stock_khz && c->oc_target_khz > c->oc_stock_khz;
+	if (c->oc_active) {
+		c->oc_row = j;
+		c->osm_table[j] = c->osm_table[j - 1];
+		c->osm_table[j].frequency = (unsigned long)c->oc_target_khz * 1000;
+		clk_osm_oc_apply(c, j);
+		nothing_oc_dump_lut(c, "post-attempt");
+		pr_info("Nothing-OC: cluster=%u software top=%u kHz hardware-accepted=%u stock-clamp=%u kHz initial thermal state=blocked; saved stock entries=%u, stock writes=0\n",
+			c->cluster_num, c->oc_target_khz, c->oc_hw_verified,
+			c->oc_stock_khz, c->oc_stock_entries);
+		j++;
+	}
+#endif
 
 	osm_clks_init[c->cluster_num].rate_max = devm_kcalloc(&pdev->dev,
 						 j, sizeof(unsigned long),
@@ -1137,6 +1769,10 @@ static int clk_cpu_osm_driver_probe(struct platform_device *pdev)
 	else if (is_trinket)
 		clk_cpu_osm_driver_trinket_fixup();
 
+#ifdef CONFIG_NOTHING_OC
+	nothing_oc_configure(pdev);
+#endif
+
 	clk_data = devm_kzalloc(&pdev->dev, sizeof(struct clk_onecell_data),
 								GFP_KERNEL);
 	if (!clk_data)
@@ -1252,6 +1888,17 @@ static int clk_cpu_osm_driver_probe(struct platform_device *pdev)
 	if (rc)
 		goto provider_err;
 
+#ifdef CONFIG_NOTHING_OC
+	if (is_sdmmagpie && nothing_oc_enabled && nothing_oc_dt_ready) {
+		if (register_pm_notifier(&nothing_oc_pm_notifier)) {
+			pr_info("Nothing-OC: suspend guard registration failed; OC remains stock-clamped\n");
+		} else {
+			nothing_oc_pm_registered = true;
+			queue_delayed_work(system_highpri_wq, &nothing_oc_work, 0);
+		}
+	}
+#endif
+
 	pr_info("OSM CPUFreq driver inited\n");
 	return 0;
 
@@ -1293,6 +1940,13 @@ subsys_initcall(clk_cpu_osm_init);
 
 static void __exit clk_cpu_osm_exit(void)
 {
+#ifdef CONFIG_NOTHING_OC
+	if (nothing_oc_pm_registered) {
+		WRITE_ONCE(nothing_oc_suspended, true);
+		unregister_pm_notifier(&nothing_oc_pm_notifier);
+		cancel_delayed_work_sync(&nothing_oc_work);
+	}
+#endif
 	platform_driver_unregister(&clk_cpu_osm_driver);
 }
 module_exit(clk_cpu_osm_exit);

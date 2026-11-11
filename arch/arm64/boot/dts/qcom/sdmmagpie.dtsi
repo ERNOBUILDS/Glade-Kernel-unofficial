@@ -984,6 +984,17 @@
 			   &cdsp_cdsp_l3_lat>;
 
 		#clock-cells = <1>;
+
+#ifdef CONFIG_NOTHING_OC
+		/* Consumed by clk-cpu-osm.c, not the legacy cpufreq DT lists. */
+		nothing,oc-target-khz = <2112000 2592000>;
+		nothing,oc-stock-max-khz = <1804800 2304000>;
+		nothing,oc-thermal-zones = "cpu-0-max-step", "cpu-1-max-step",
+			"quiet_therm";
+		nothing,oc-trip-millicelsius = <70000 70000 42000>;
+		nothing,oc-resume-millicelsius = <60000 60000 39000>;
+#endif
+
 		qcom,cpufreq-table-0 =
 			< 300000>,
 			< 576000>,
