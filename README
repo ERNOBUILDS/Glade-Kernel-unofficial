@@ -1,3 +1,47 @@
+ERNOBUILDS vmalloc lock repair (unofficial)
+============================================
+
+Status, attribution, and support
+--------------------------------
+
+This branch is an unofficial ERNOBUILDS modification of Glade Kernel. It is
+not an official Glade release and is not supported by the Glade developer.
+Credit for the original kernel belongs to Glade and its contributors:
+
+https://github.com/hrihq/Glade-Kernel
+
+The branch is based on Glade commit
+``2aba3f843f402cc205d5adf3f5d60825b4890e6a``. Its source-level change fixes
+the ``mm/vmalloc.c`` sequence iterator: ``s_start()`` acquires
+``vmap_purge_lock`` and ``vmap_area_lock``, so ``s_stop()`` now releases both
+locks in reverse order.
+
+Binary and source relationship
+------------------------------
+
+The tested recovery-flashable kernel was **not compiled from this branch**.
+The existing ``4.14.357-glade-g2aba3f843f40-dirty`` ARM64 kernel Image was
+patched directly: exactly 24 bytes at decompressed Image offset ``0x139458``
+were replaced to add the missing ``mutex_unlock(&vmap_purge_lock)`` call, and
+the boot image was then repacked. This branch records the source-equivalent
+repair for review and reference; it does not claim byte-for-byte reproduction
+of that binary.
+
+Known ``-dirty`` source gap -- placeholder
+------------------------------------------
+
+The Glade developer confirmed that the tested ``-dirty`` binary was built
+from commit ``2aba3f843f402cc205d5adf3f5d60825b4890e6a`` plus uncommitted local
+changes. Those local changes have not yet been provided and are not present in
+this branch.
+
+**TODO:** When the developer supplies those changes, preserve and add them
+with clear provenance, then document the matching build configuration and
+toolchain. Until that happens, this branch must not be described as the exact
+or complete corresponding source for the shipped ``-dirty`` binary. Anyone
+redistributing that binary under GPLv2 must resolve this source gap rather
+than relying on this branch alone.
+
 Linux kernel
 ============
 
