@@ -58,6 +58,7 @@ extern "C" {
  *  Max supported `srcSize` value is LZ4_MAX_INPUT_SIZE (see "lz4.h")
  * `compressionLevel` : any value between 1 and LZ4HC_CLEVEL_MAX will work.
  *                      Values > LZ4HC_CLEVEL_MAX behave the same as LZ4HC_CLEVEL_MAX.
+ * `wrkmem` : caller-owned, 8-byte-aligned workspace of LZ4_sizeofStateHC() bytes.
  * @return : the number of bytes written into 'dst'
  *           or 0 if compression fails.
  */
@@ -227,6 +228,16 @@ LZ4_attach_HC_dictionary(LZ4_streamHC_t *working_stream,
 #define LZ4HC_HASHTABLESIZE (1 << LZ4HC_HASH_LOG)
 #define LZ4HC_HASH_MASK (LZ4HC_HASHTABLESIZE - 1)
 
+#define LZ4_OPT_NUM (1 << 12)
+#define LZ4HC_TRAILING_LITERALS 3
+
+typedef struct {
+	int price;
+	int off;
+	int mlen;
+	int litlen;
+} LZ4HC_optimal_t;
+
 /* Never ever use these definitions directly !
  * Declare or allocate an LZ4_streamHC_t instead.
 **/
@@ -245,10 +256,14 @@ struct LZ4HC_CCtx_internal {
                                 otherwise, favor compression ratio */
 	LZ4_i8 dirty; /* stream has to be fully reset if this flag is set */
 	const LZ4HC_CCtx_internal *dictCtx;
+	/* Optimal parsing needs ~64 KiB; keep it off the kernel stack. */
+	LZ4HC_optimal_t optimal[LZ4_OPT_NUM + LZ4HC_TRAILING_LITERALS];
 };
 
-#define LZ4_STREAMHC_MINSIZE                                                   \
-	262200 /* static size, for inter-version compatibility */
+/* Kernel state includes per-stream scratch, unlike the upstream userspace ABI. */
+#define LZ4_STREAMHC_MINSIZE \
+	(262200 + sizeof(LZ4HC_optimal_t) * \
+	 (LZ4_OPT_NUM + LZ4HC_TRAILING_LITERALS))
 union LZ4_streamHC_u {
 	char minStateSize[LZ4_STREAMHC_MINSIZE];
 	LZ4HC_CCtx_internal internal_donotuse;
@@ -256,7 +271,7 @@ union LZ4_streamHC_u {
 
 /* LZ4_streamHC_t :
  * This structure allows static allocation of LZ4 HC streaming state.
- * This can be used to allocate statically on stack, or as part of a larger structure.
+ * Allocate this in caller-owned memory, never on the kernel stack.
  *
  * Such state **must** be initialized using LZ4_initStreamHC() before first use.
  *

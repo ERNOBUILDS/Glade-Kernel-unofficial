@@ -41,16 +41,6 @@
 #define LZ4_HC_STATIC_LINKING_ONLY
 #include "lz4hc.h"
 
-/*! HEAPMODE :
- *  Select how stateless HC compression functions like `LZ4_compress_HC()`
- *  allocate memory for their workspace:
- *  in stack (0:fastest), or in heap (1:default, requires malloc()).
- *  Since workspace is rather large, heap mode is recommended.
-**/
-#ifndef LZ4HC_HEAPMODE
-#define LZ4HC_HEAPMODE 1
-#endif
-
 /*===   Shared lz4.c code   ===*/
 #ifndef LZ4_SRC_INCLUDED
 #if defined(__GNUC__)
@@ -68,7 +58,6 @@ typedef enum { noDictCtx, usingDictCtxHc } dictCtx_directive;
 
 /*===   Constants   ===*/
 #define OPTIMAL_ML (int)((ML_MASK - 1) + MINMATCH)
-#define LZ4_OPT_NUM (1 << 12)
 
 /*===   Macros   ===*/
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -1867,7 +1856,9 @@ static int LZ4HC_compress_generic_dictCtx(LZ4HC_CCtx_internal *const ctx,
 			ctx, src, dst, srcSizePtr, dstCapacity, cLevel, limit);
 	} else if (position == 0 && *srcSizePtr > 4 KB &&
 		   isStateCompatible(ctx, ctx->dictCtx)) {
-		LZ4_memcpy(ctx, ctx->dictCtx, sizeof(LZ4HC_CCtx_internal));
+		/* Parser scratch is private to this stream, not dictionary state. */
+		LZ4_memcpy(ctx, ctx->dictCtx,
+			   offsetof(LZ4HC_CCtx_internal, optimal));
 		LZ4HC_setExternalDict(ctx, (const BYTE *)src);
 		ctx->compressionLevel = (short)cLevel;
 		return LZ4HC_compress_generic_noDictCtx(
@@ -2008,7 +1999,8 @@ LZ4_streamHC_t *LZ4_initStreamHC(void *buffer, size_t size)
 	{
 		LZ4HC_CCtx_internal *const hcstate =
 			&(LZ4_streamHCPtr->internal_donotuse);
-		MEM_INIT(hcstate, 0, sizeof(*hcstate));
+		/* The optimal parser initializes scratch as it uses it. */
+		MEM_INIT(hcstate, 0, offsetof(LZ4HC_CCtx_internal, optimal));
 	}
 	LZ4_setCompressionLevel(LZ4_streamHCPtr, LZ4HC_CLEVEL_DEFAULT);
 	return LZ4_streamHCPtr;
@@ -2253,13 +2245,6 @@ int LZ4_saveDictHC(LZ4_streamHC_t *LZ4_streamHCPtr, char *safeBuffer,
 /* ================================================
  *  LZ4 Optimal parser (levels [LZ4HC_CLEVEL_OPT_MIN - LZ4HC_CLEVEL_MAX])
  * ===============================================*/
-typedef struct {
-	int price;
-	int off;
-	int mlen;
-	int litlen;
-} LZ4HC_optimal_t;
-
 /* price in bytes */
 LZ4_FORCE_INLINE int LZ4HC_literalsPrice(int const litlen)
 {
@@ -2317,15 +2302,8 @@ static int LZ4HC_compress_optimal(LZ4HC_CCtx_internal *ctx,
 				  const HCfavor_e favorDecSpeed)
 {
 	int retval = 0;
-#define TRAILING_LITERALS 3
-#if defined(LZ4HC_HEAPMODE) && LZ4HC_HEAPMODE == 1
-	LZ4HC_optimal_t *const opt = (LZ4HC_optimal_t *)ALLOC(
-		sizeof(LZ4HC_optimal_t) * (LZ4_OPT_NUM + TRAILING_LITERALS));
-#else
-	LZ4HC_optimal_t
-		opt[LZ4_OPT_NUM +
-		    TRAILING_LITERALS]; /* ~64 KB, which is a bit large for stack... */
-#endif
+#define TRAILING_LITERALS LZ4HC_TRAILING_LITERALS
+	LZ4HC_optimal_t *const opt = ctx->optimal;
 
 	const BYTE *ip = (const BYTE *)source;
 	const BYTE *anchor = ip;
@@ -2339,10 +2317,6 @@ static int LZ4HC_compress_optimal(LZ4HC_CCtx_internal *ctx,
 	int ovoff = 0;
 
 	/* init */
-#if defined(LZ4HC_HEAPMODE) && LZ4HC_HEAPMODE == 1
-	if (opt == NULL)
-		goto _return_label;
-#endif
 	DEBUGLOG(5, "LZ4HC_compress_optimal(dst=%p, dstCapa=%u)", dst,
 		 (unsigned)dstCapacity);
 	*srcSizePtr = 0;
@@ -2731,10 +2705,6 @@ _dest_overflow:
 		goto _last_literals;
 	}
 _return_label:
-#if defined(LZ4HC_HEAPMODE) && LZ4HC_HEAPMODE == 1
-	if (opt)
-		FREEMEM(opt);
-#endif
 	return retval;
 }
 

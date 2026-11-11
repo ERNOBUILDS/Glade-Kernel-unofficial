@@ -132,8 +132,6 @@ extern "C" {
  *  - See tests/freestanding.c to check its basic setup.
  */
 #if defined(LZ4_FREESTANDING) && (LZ4_FREESTANDING == 1)
-#define LZ4_HEAPMODE 0
-#define LZ4HC_HEAPMODE 0
 #define LZ4_STATIC_LINKING_ONLY_DISABLE_MEMORY_ALLOCATION 1
 #if !defined(LZ4_memcpy)
 #error "LZ4_FREESTANDING requires macro 'LZ4_memcpy'."
@@ -211,6 +209,7 @@ LZ4LIB_API const char *LZ4_versionString(
  *      dstCapacity : size of buffer 'dst' (which must be already allocated)
  *     @return  : the number of bytes written into buffer 'dst' (necessarily <= dstCapacity)
  *                or 0 if compression fails
+ *      wrkmem : caller-owned, 8-byte-aligned workspace of LZ4_sizeofState() bytes.
  * Note : This function is protected against buffer overflow scenarios (never writes outside 'dst' buffer, nor read outside 'source' buffer).
  */
 LZ4LIB_API int LZ4_compress_default(const char *src, char *dst, int srcSize,
@@ -260,10 +259,11 @@ LZ4LIB_API int LZ4_compressBound(int inputSize);
     It's a trade-off. It can be fine tuned, with each successive value providing roughly +~3% to speed.
     An acceleration value of "1" is the same as regular LZ4_compress_default()
     Values <= 0 will be replaced by LZ4_ACCELERATION_DEFAULT (currently == 1, see lz4.c).
-    Values > LZ4_ACCELERATION_MAX will be replaced by LZ4_ACCELERATION_MAX (currently == 65537, see lz4.c).
+     Values > LZ4_ACCELERATION_MAX will be replaced by LZ4_ACCELERATION_MAX (currently == 65537, see lz4.c).
+    wrkmem must provide LZ4_sizeofState() bytes, aligned on an 8-byte boundary.
 */
 LZ4LIB_API int LZ4_compress_fast(const char *src, char *dst, int srcSize,
-				 int dstCapacity, int acceleration);
+				 int dstCapacity, int acceleration, void *wrkmem);
 
 /*! LZ4_compress_fast_extState() :
  *  Same as LZ4_compress_fast(), using an externally allocated memory space for its state.
@@ -282,6 +282,7 @@ LZ4LIB_API int LZ4_compress_fast_extState(void *state, const char *src,
  *  This function either compresses the entire 'src' content into 'dst' if it's large enough,
  *  or fill 'dst' buffer completely with as much data as possible from 'src'.
  *  note: acceleration parameter is fixed to "default".
+ *  wrkmem must provide LZ4_sizeofState() bytes, aligned on an 8-byte boundary.
  *
  * *srcSizePtr : in+out parameter. Initially contains size of input.
  *               Will be modified to indicate how many bytes where read from 'src' to fill 'dst'.
@@ -301,7 +302,8 @@ LZ4LIB_API int LZ4_compress_fast_extState(void *state, const char *src,
  *        See https://github.com/lz4/lz4/issues/859 for details
  */
 LZ4LIB_API int LZ4_compress_destSize(const char *src, char *dst,
-				     int *srcSizePtr, int targetDstSize);
+				     int *srcSizePtr, int targetDstSize,
+				     void *wrkmem);
 
 /*! LZ4_decompress_safe_partial() :
  *  Decompress an LZ4 compressed block, of size 'srcSize' at position 'src',

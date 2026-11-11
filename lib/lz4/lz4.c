@@ -36,16 +36,6 @@
 *  Tuning parameters
 **************************************/
 /*
- * LZ4_HEAPMODE :
- * Select how stateless compression functions like `LZ4_compress_default()`
- * allocate memory for their hash table,
- * in memory stack (0:default, fastest), or in memory heap (1:requires malloc()).
- */
-#ifndef LZ4_HEAPMODE
-#define LZ4_HEAPMODE 0
-#endif
-
-/*
  * LZ4_ACCELERATION_DEFAULT :
  * Select "acceleration" for LZ4_compress_fast() when parameter value <= 0
  */
@@ -1712,25 +1702,10 @@ int LZ4_compress_fast_extState_fastReset(void *state, const char *src,
 }
 
 int LZ4_compress_fast(const char *src, char *dest, int srcSize, int dstCapacity,
-		      int acceleration)
+		      int acceleration, void *wrkmem)
 {
-	int result;
-#if (LZ4_HEAPMODE)
-	LZ4_stream_t *const ctxPtr = (LZ4_stream_t *)ALLOC(sizeof(
-		LZ4_stream_t)); /* malloc-calloc always properly aligned */
-	if (ctxPtr == NULL)
-		return 0;
-#else
-	LZ4_stream_t ctx;
-	LZ4_stream_t *const ctxPtr = &ctx;
-#endif
-	result = LZ4_compress_fast_extState(ctxPtr, src, dest, srcSize,
-					    dstCapacity, acceleration);
-
-#if (LZ4_HEAPMODE)
-	FREEMEM(ctxPtr);
-#endif
-	return result;
+	return LZ4_compress_fast_extState(wrkmem, src, dest, srcSize,
+					  dstCapacity, acceleration);
 }
 
 int LZ4_compress_default(const char *src, char *dst, int srcSize,
@@ -1795,25 +1770,10 @@ int LZ4_compress_destSize_extState(void *state, const char *src, char *dst,
 }
 
 int LZ4_compress_destSize(const char *src, char *dst, int *srcSizePtr,
-			  int targetDstSize)
+			  int targetDstSize, void *wrkmem)
 {
-#if (LZ4_HEAPMODE)
-	LZ4_stream_t *const ctx = (LZ4_stream_t *)ALLOC(sizeof(
-		LZ4_stream_t)); /* malloc-calloc always properly aligned */
-	if (ctx == NULL)
-		return 0;
-#else
-	LZ4_stream_t ctxBody;
-	LZ4_stream_t *const ctx = &ctxBody;
-#endif
-
-	int result = LZ4_compress_destSize_extState_internal(
-		ctx, src, dst, srcSizePtr, targetDstSize, 1);
-
-#if (LZ4_HEAPMODE)
-	FREEMEM(ctx);
-#endif
-	return result;
+	return LZ4_compress_destSize_extState(wrkmem, src, dst, srcSizePtr,
+					   targetDstSize, 1);
 }
 
 /*-******************************
