@@ -84,6 +84,7 @@ static struct selinux_ss selinux_ss;
 void selinux_ss_init(struct selinux_ss **ss)
 {
 	rwlock_init(&selinux_ss.policy_rwlock);
+	mutex_init(&selinux_ss.policy_mutex);
 	mutex_init(&selinux_ss.status_lock);
 	*ss = &selinux_ss;
 }
@@ -2144,6 +2145,7 @@ int security_load_policy(struct selinux_state *state, void *data, size_t len)
 	int rc = 0;
 	struct policy_file file = { data, len }, *fp = &file;
 
+	mutex_lock(&state->ss->policy_mutex);
 	oldpolicydb = kzalloc(2 * sizeof(*oldpolicydb), GFP_KERNEL);
 	if (!oldpolicydb) {
 		rc = -ENOMEM;
@@ -2285,6 +2287,119 @@ err:
 
 out:
 	kfree(oldpolicydb);
+	mutex_unlock(&state->ss->policy_mutex);
+	return rc;
+}
+
+static int policydb_measure(struct policydb *policydb, size_t *len)
+{
+	struct policy_file fp = { .len = SIZE_MAX };
+	int rc;
+
+	rc = policydb_write(policydb, &fp);
+	if (!rc)
+		*len = SIZE_MAX - fp.len;
+	return rc;
+}
+
+/**
+ * security_update_policy - Edit a private copy and publish it atomically.
+ * @state: SELinux state
+ * @update: sleepable editor; return zero to commit or an error to discard
+ * @data: editor argument
+ *
+ * Editors may add types and change rules, but must preserve existing symbol
+ * numbers, classes, policy capabilities and initial contexts. This keeps the
+ * current SID table and class mapping valid. All allocation, editing and
+ * destruction happen outside policy_rwlock; readers can keep using the live
+ * policy while the editor sleeps. policy_mutex also excludes native reloads
+ * and boolean updates throughout preparation and cache invalidation.
+ */
+int security_update_policy(struct selinux_state *state,
+			   int (*update)(struct policydb *policydb, void *data),
+			   void *data)
+{
+	struct policydb *policydb = &state->ss->policydb;
+	struct policydb *oldpolicydb, *newpolicydb;
+	struct policy_file fp;
+	unsigned long flags;
+	void *binary;
+	size_t len;
+	u32 seqno;
+	int rc;
+
+	mutex_lock(&state->ss->policy_mutex);
+	if (!selinux_initialized(state)) {
+		rc = -EINVAL;
+		goto out_unlock;
+	}
+
+	oldpolicydb = kzalloc(2 * sizeof(*oldpolicydb), GFP_KERNEL);
+	if (!oldpolicydb) {
+		rc = -ENOMEM;
+		goto out_unlock;
+	}
+	newpolicydb = oldpolicydb + 1;
+
+	/* The loaded length need not include maps normalized by policydb_read. */
+	read_lock(&state->ss->policy_rwlock);
+	rc = policydb_measure(policydb, &len);
+	read_unlock(&state->ss->policy_rwlock);
+	if (rc)
+		goto out_free;
+
+	binary = vmalloc(len);
+	if (!binary) {
+		rc = -ENOMEM;
+		goto out_free;
+	}
+	fp.data = binary;
+	fp.len = len;
+	read_lock(&state->ss->policy_rwlock);
+	rc = policydb_write(policydb, &fp);
+	read_unlock(&state->ss->policy_rwlock);
+	if (rc) {
+		vfree(binary);
+		goto out_free;
+	}
+
+	fp.data = binary;
+	fp.len = len;
+	rc = policydb_read(newpolicydb, &fp);
+	vfree(binary);
+	/* policydb_read destroys its own partially initialized database. */
+	if (rc)
+		goto out_free;
+	newpolicydb->len = len;
+
+	rc = update(newpolicydb, data);
+	if (rc)
+		goto out_destroy;
+	rc = policydb_measure(newpolicydb, &newpolicydb->len);
+	if (rc)
+		goto out_destroy;
+
+	/* Drain old readers before replacing their policy and freeing it. */
+	write_lock_irqsave(&state->ss->policy_rwlock, flags);
+	*oldpolicydb = *policydb;
+	*policydb = *newpolicydb;
+	seqno = ++state->ss->latest_granting;
+	write_unlock_irqrestore(&state->ss->policy_rwlock, flags);
+	policydb_destroy(oldpolicydb);
+
+	avc_ss_reset(state->avc, seqno);
+	selnl_notify_policyload(seqno);
+	selinux_status_update_policyload(state, seqno);
+	selinux_netlbl_cache_invalidate();
+	selinux_xfrm_notify_policyload();
+	goto out_free;
+
+out_destroy:
+	policydb_destroy(newpolicydb);
+out_free:
+	kfree(oldpolicydb);
+out_unlock:
+	mutex_unlock(&state->ss->policy_mutex);
 	return rc;
 }
 
@@ -2907,6 +3022,7 @@ int security_set_bools(struct selinux_state *state, int len, int *values)
 	int lenp, seqno = 0;
 	struct cond_node *cur;
 
+	mutex_lock(&state->ss->policy_mutex);
 	write_lock_irq(&state->ss->policy_rwlock);
 
 	policydb = &state->ss->policydb;
@@ -2949,6 +3065,7 @@ out:
 		selinux_status_update_policyload(state, seqno);
 		selinux_xfrm_notify_policyload();
 	}
+	mutex_unlock(&state->ss->policy_mutex);
 	return rc;
 }
 
@@ -3742,11 +3859,14 @@ int security_read_policy(struct selinux_state *state,
 	if (!selinux_initialized(state))
 		return -EINVAL;
 
+	mutex_lock(&state->ss->policy_mutex);
 	*len = security_policydb_len(state);
 
 	*data = vmalloc_user(*len);
-	if (!*data)
-		return -ENOMEM;
+	if (!*data) {
+		rc = -ENOMEM;
+		goto out_unlock;
+	}
 
 	fp.data = *data;
 	fp.len = *len;
@@ -3755,10 +3875,9 @@ int security_read_policy(struct selinux_state *state,
 	rc = policydb_write(policydb, &fp);
 	read_unlock(&state->ss->policy_rwlock);
 
-	if (rc)
-		return rc;
-
-	*len = (unsigned long)fp.data - (unsigned long)*data;
-	return 0;
-
+	if (!rc)
+		*len = (unsigned long)fp.data - (unsigned long)*data;
+out_unlock:
+	mutex_unlock(&state->ss->policy_mutex);
+	return rc;
 }

@@ -27,6 +27,8 @@ struct selinux_ss {
 	struct sidtab *sidtab;
 	struct policydb policydb;
 	rwlock_t policy_rwlock;
+	/* Serialize policy preparation as well as publication by all writers. */
+	struct mutex policy_mutex;
 	u32 latest_granting;
 	struct selinux_map map;
 	struct page *status_page;
@@ -40,5 +42,12 @@ void services_compute_xperms_decision(struct extended_perms_decision *xpermd,
 					struct avtab_node *node);
 
 int context_add_hash(struct policydb *policydb, struct context *context);
+
+/* Sleepable, copy-on-update policy editing for in-tree users. */
+#define SELINUX_POLICYDB_UPDATE 1
+struct selinux_state;
+int security_update_policy(struct selinux_state *state,
+			   int (*update)(struct policydb *policydb, void *data),
+			   void *data);
 
 #endif	/* _SS_SERVICES_H_ */
