@@ -630,7 +630,13 @@ static int pil_init_image_trusted(struct pil_desc *pil,
 		return -ENOMEM;
 	}
 
-	memcpy(mdata_buf, metadata, size);
+	/*
+	 * DMA_ATTR_STRONGLY_ORDERED maps Device memory on arm64. Normal memcpy
+	 * can issue unaligned accesses, including when copying the final bytes.
+	 */
+	memcpy_toio((void __iomem *)mdata_buf, metadata, size);
+	/* Publish the metadata before asking secure firmware to authenticate it. */
+	wmb();
 	if (!is_scm_armv8()) {
 		request.proc = d->pas_id;
 		request.image_addr = mdata_phys;
