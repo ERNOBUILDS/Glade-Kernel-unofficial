@@ -68,14 +68,16 @@ static int apply_kernelsu_rules_fn(void *ptr)
 {
 	struct policydb *db = (struct policydb *)ptr;
 
-	ksu_type(db, KERNEL_SU_DOMAIN, "domain");
-	ksu_permissive(db, KERNEL_SU_DOMAIN);
+	if (!ksu_type(db, KERNEL_SU_DOMAIN, "domain") ||
+	    !ksu_permissive(db, KERNEL_SU_DOMAIN))
+		return -EINVAL;
 	ksu_typeattribute(db, KERNEL_SU_DOMAIN, "mlstrustedsubject");
 	ksu_typeattribute(db, KERNEL_SU_DOMAIN, "netdomain");
 	ksu_typeattribute(db, KERNEL_SU_DOMAIN, "bluetoothdomain");
 
 	// Create unconstrained file type
-	ksu_type(db, KERNEL_SU_FILE, "file_type");
+	if (!ksu_type(db, KERNEL_SU_FILE, "file_type"))
+		return -EINVAL;
 	ksu_typeattribute(db, KERNEL_SU_FILE, "mlstrustedobject");
 	ksu_allow(db, "domain", KERNEL_SU_FILE, ALL, ALL);
 
@@ -145,12 +147,25 @@ static int apply_kernelsu_rules_fn(void *ptr)
 	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getopt");
 	ksu_allow(db, "domain", KERNEL_SU_DOMAIN, "unix_stream_socket", "getattr");
 
+#ifdef CONFIG_KSU_SUSFS
+	/* Publish this rule with the rest of the policy, before resetting AVC. */
+	ksu_allow(db, "zygote", "labeledfs", "filesystem", "unmount");
+#endif
+
 	return 0;
 }
 
-void apply_kernelsu_rules()
+#ifdef SELINUX_POLICYDB_UPDATE
+static int apply_kernelsu_rules_update(struct policydb *db, void *data)
+{
+	return apply_kernelsu_rules_fn(db);
+}
+#endif
+
+int apply_kernelsu_rules(void)
 {
 	struct policydb *db;
+	int ret = 0;
 
 	if (!getenforce()) {
 		pr_info("SELinux permissive or disabled, apply rules!\n");
@@ -163,11 +178,16 @@ void apply_kernelsu_rules()
 	pol = ksu_dup_sepolicy(old_pol);
 	if (IS_ERR(pol)) {
 		pr_err("failed to dup selinux_policy: %ld\n", PTR_ERR(pol));
+		ret = PTR_ERR(pol);
 		goto out_unlock;
 	}
 	db = &pol->policydb;
 
-	apply_kernelsu_rules_fn((void *)db);
+	ret = apply_kernelsu_rules_fn((void *)db);
+	if (ret) {
+		ksu_destroy_sepolicy(pol);
+		goto out_unlock;
+	}
 
 	rcu_assign_pointer(selinux_state.policy, pol);
 	synchronize_rcu();
@@ -176,6 +196,14 @@ void apply_kernelsu_rules()
 	reset_avc_cache();
 out_unlock:
 	mutex_unlock(&selinux_state.policy_mutex);
+#elif defined(SELINUX_POLICYDB_UPDATE)
+	pr_warn("policy update: preparing private copy\n");
+	ret = security_update_policy(&selinux_state,
+				     apply_kernelsu_rules_update, NULL);
+	if (ret)
+		pr_err("policy update: failed: %d\n", ret);
+	else
+		pr_warn("policy update: committed\n");
 #else
 
 	db = get_policydb();
@@ -195,7 +223,7 @@ out_unlock:
 	write_lock(lock);
 	preempt_enable();
 
-	apply_kernelsu_rules_fn((void *)db);
+	ret = apply_kernelsu_rules_fn((void *)db);
 
 	preempt_disable();
 	write_unlock(lock);
@@ -204,20 +232,21 @@ out_unlock:
 
 do_stop_machine:
 	pr_info("%s: type: stop_machine()\n", __func__);
-	stop_machine(apply_kernelsu_rules_fn, (void *)db, NULL);
+	ret = stop_machine(apply_kernelsu_rules_fn, (void *)db, NULL);
 
 out_flush:
 	smp_mb();
 	reset_avc_cache();
 #endif
+	if (ret)
+		return ret;
 #ifdef CONFIG_KSU_SUSFS
-    // Allow umount in zygote process without installing zygisk
-    ksu_allow(db, "zygote", "labeledfs", "filesystem", "unmount");
     susfs_set_priv_app_sid();
     susfs_set_init_sid();
     susfs_set_ksu_sid();
     susfs_set_zygote_sid();
 #endif // #ifdef CONFIG_KSU_SUSFS
+	return 0;
 }
 
 #define KSU_SEPOLICY_MAX_BATCH_SIZE (8U * 1024U * 1024U)
@@ -595,6 +624,7 @@ struct handle_sepolicy_args {
 	void *ctx_success_cmd_count;
 	void *ctx_payload;
 	u64 ctx_data_len;
+	struct policydb *db;
 };
 
 static int handle_sepolicy_fn(void *data)
@@ -604,8 +634,8 @@ static int handle_sepolicy_fn(void *data)
 	u32 cmd_index = 0;
 	int success_cmd_count = 0;
 
-	struct policydb *db = get_policydb();
 	struct handle_sepolicy_args *ctx = (struct handle_sepolicy_args *)data;
+	struct policydb *db = ctx->db ? ctx->db : get_policydb();
 	u8 *payload = (u8 *)ctx->ctx_payload;
 	u64 data_len = ctx->ctx_data_len;
 
@@ -640,12 +670,16 @@ static int handle_sepolicy_fn(void *data)
 		}
 
 		ret = apply_one_sepolicy_cmd(db, &header, args);
-		if (ret < 0)
+		if (ret < 0) {
 			pr_err("sepol: cmd #%u failed, cmd=%u subcmd=%u.\n", cmd_index, header.cmd, header.subcmd);
-		else {
+			/* A private-copy transaction must discard failed edits. */
+			if (ctx->db)
+				goto out;
+		} else {
 			pr_info("sepol: cmd #%u success, cmd=%u subcmd=%u.\n", cmd_index, header.cmd, header.subcmd);
 			success_cmd_count++;
-			ksu_add_shit_to_list(header.cmd, args);
+			if (!ctx->db)
+				ksu_add_shit_to_list(header.cmd, args);
 		}
 
 		cmd_index++;
@@ -655,6 +689,38 @@ out:
 	*(int *)(ctx->ctx_success_cmd_count) = success_cmd_count;
 	return ret;
 }
+
+#ifdef SELINUX_POLICYDB_UPDATE
+static int handle_sepolicy_update(struct policydb *db, void *data)
+{
+	struct handle_sepolicy_args *ctx = data;
+
+	ctx->db = db;
+	return handle_sepolicy_fn(ctx);
+}
+
+/* Track only commands from a successfully committed, validated batch. */
+static void track_sepolicy_batch(const u8 *payload, size_t len)
+{
+	struct sepol_batch_cursor cursor = { payload, payload + len };
+
+	while (cursor.cur < cursor.end) {
+		struct sepol_data header;
+		const char *args[KSU_SEPOLICY_MAX_ARGS] = { 0 };
+		int argc, i;
+
+		if (sepol_read_cmd_header(&cursor, &header))
+			return;
+		argc = sepol_expected_argc(header.cmd);
+		if (argc < 0 || argc > KSU_SEPOLICY_MAX_ARGS)
+			return;
+		for (i = 0; i < argc; i++)
+			if (sepol_read_string(&cursor, &args[i]))
+				return;
+		ksu_add_shit_to_list(header.cmd, args);
+	}
+}
+#endif
 
 int handle_sepolicy(void __user *user_data, u64 data_len)
 {
@@ -686,6 +752,13 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
 	ctx.ctx_payload = (void *)payload;
 	ctx.ctx_data_len = (u64)data_len;
 
+#ifdef SELINUX_POLICYDB_UPDATE
+	ret = security_update_policy(&selinux_state, handle_sepolicy_update, &ctx);
+	if (!ret) {
+		track_sepolicy_batch(payload, (size_t)data_len);
+		ret = success_cmd_count;
+	}
+#else
 	// HACK: lock is held with preempt enabled!
 	rwlock_t *lock = ksu_get_policy_rwlock();
 	if (!lock)
@@ -712,6 +785,7 @@ out_done:
 	smp_mb();
 	reset_avc_cache();
 	ret = success_cmd_count;
+#endif
 
 out_free:
 	kvfree(payload);

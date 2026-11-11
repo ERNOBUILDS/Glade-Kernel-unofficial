@@ -304,6 +304,8 @@ module_param(allow_shell, bool, 0);
 
 static int __init kernelsu_lkm_init(void)
 {
+	int ret;
+
 	kernelsu_init();
 
 	ksu_extend_module_blacklist();
@@ -320,7 +322,9 @@ static int __init kernelsu_lkm_init(void)
 	// turn off vfs_read hook
 	stop_vfs_read_hook();
 
-	apply_kernelsu_rules();
+	ret = apply_kernelsu_rules();
+	if (ret)
+		return ret;
 	cache_sid();
 	setup_ksu_cred();
 
