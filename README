@@ -1,3 +1,64 @@
+Nothing kernel OC1 -- unofficial ERNOBUILDS build
+================================================
+
+This is an unofficial Nothing kernel modification for Redmi Note 12 Pro 4G
+(sweet, Snapdragon 732G / SM7150-AC). It is not an official Glade release.
+Credit for Glade belongs to Frnzhermanz and its contributors:
+
+https://github.com/hrihq/Glade-Kernel
+
+Current source and GPLv2 corresponding source
+--------------------------------------------
+
+The CPU-OC source baseline is tagged ``nothing-oc1-working`` at:
+
+https://github.com/ERNOBUILDS/Glade-Kernel-unofficial/tree/nothing-oc1-working
+
+The owner reports that OC1 boots and that 2112 MHz little / 2592 MHz big
+work and are selectable in Franco Kernel Manager. The tag records the tested
+CPU-OC implementation, One UI vmalloc freeze fix, boot-safe PIL copy,
+memory-copy/LZ4 changes, diagnostics, packaging source and exact source-form
+``arch/arm64/configs/nothing_oc1_defconfig`` configuration. It also records
+four pre-existing KernelSU compatibility edits byte-for-byte with the owner's
+explicit permission; publication did not edit any KernelSU code.
+
+The kernel is licensed under GPLv2; see COPYING and the retained per-file
+licenses/copyrights. This repository provides the corresponding source,
+configuration and build/packaging scripts for this from-source OC1 build.
+Redistributors must provide the complete matching GPLv2 corresponding source,
+not substitute a binary-only patch or rely on source from a different build.
+Toolchain/build instructions and the pinned AnyKernel template revision are in
+Documentation/nothing-oc1.md and Documentation/nothing-kernel.md. Rebuild byte
+identity is not claimed independently of toolchain and build timestamps.
+No kernel Images, DT payloads, ZIPs, logs or credentials are committed here;
+this source push does not publish release ZIPs.
+
+Experimental overclocking -- use entirely at your own risk
+----------------------------------------------------------
+
+CPU overclocking is optional (CONFIG_NOTHING_OC / nothing.oc=0). The targets
+are 2.112 GHz little and 2.592 GHz big. The working OC1 voltage/thermal policy
+is preserved: the old fixed +32 mV open-loop request is removed; only new LUT
+rows use a bounded stock-slope-derived +4--8 mV. Stock voltages and CPR corners
+are not raised, and OVERRIDE is not programmed. CPU >=70 C or board/skin proxy
+>=42 C caps requests at stock, with 60 C / 39 C resume thresholds. Missing or
+stale sensors, suspend and rejected/revoked LUT writes also block OC.
+
+Owner-reported success and software frequency selection are not independent
+PLL-lock or actual-rail-voltage measurements. Voltage/thermal margin and
+long-term stability are unverified. Risks include boot failure, hangs, reboots,
+frame drops, overheating, battery stress, hardware ageing, GPU/CPU instability
+and data corruption. No warranty or promise of gaming performance is made.
+The installer keeps the "Nothing kernel" name and prints ERNOBUILDS.
+
+Historical pre-OC1 vmalloc binary-patch notice
+---------------------------------------------
+
+The following preserved notice concerns the earlier developer-supplied
+``4.14.357-glade-g2aba3f843f40-dirty`` binary, NOT this compiled OC1 baseline.
+Its unresolved upstream dirty-source gap must not be confused with the
+from-source OC1 implementation and configuration described above.
+
 ERNOBUILDS vmalloc lock repair (unofficial)
 ============================================
 
